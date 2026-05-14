@@ -1,8 +1,10 @@
 // 遠藤歯科クリニック - シフト同期ワーカー
 // shift_sync_requests テーブルの pending 行を拾い、Dentis をスクレイピングして shifts を更新する
+// 参考: https://d.dentis-cloud.com/dental/
 
 import { chromium } from 'playwright';
 
+// ============== 環境変数 ==============
 const DENTIS_USERNAME = process.env.DENTIS_USERNAME;
 const DENTIS_PASSWORD = process.env.DENTIS_PASSWORD;
 const DENTIS_SLUG = process.env.DENTIS_SLUG || 'JvbrMX';
@@ -10,7 +12,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 if (!DENTIS_USERNAME || !DENTIS_PASSWORD || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('必須環境変数が不足しています');
+  console.error('必須環境変数が不足しています: DENTIS_USERNAME, DENTIS_PASSWORD, SUPABASE_URL, SUPABASE_KEY');
   process.exit(1);
 }
 
@@ -176,4 +178,97 @@ function aggregate(year, month, attendees, visits, roleMap) {
     const ouStaff = new Set();
     for (const slot of slots) {
       const vs = slot.staff || [];
-      if (vs.length >= 4) vs.forEach(s =>
+      if (vs.length >= 4) vs.forEach(s => ouStaff.add(s));
+      else if (vs.length >= 1 && vs.includes('院長')) ouStaff.add('院長');
+    }
+    for (const n of ouStaff) {
+      const ent = ensure(n);
+      ent.days.delete(day);
+      ent.hcd.add(day);
+    }
+    for (const slot of slots) {
+      for (const n of slot.staff || []) {
+        if (!ouStaff.has(n)) ensure(n).days.add(day);
+      }
+    }
+  }
+  return Object.entries(staffMap).map(([name, ent]) => ({
+    year,
+    month,
+    staff_name: name,
+    staff_role: ROLE_TO_GROUP[ent.role] || ent.role,
+    staff_group: ROLE_TO_GROUP[ent.role] || ent.role,
+    display_order: ORDER_MAP[name] || 99,
+    days: [...ent.days].sort((a,b) => a - b),
+    house_call_days: [...ent.hcd].sort((a,b) => a - b)
+  })).sort((a,b) => a.display_order - b.display_order);
+}
+
+async function writeShifts(year, month, records) {
+  await sb(`shifts?year=eq.${year}&month=eq.${month}`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' }
+  });
+  if (records.length === 0) return;
+  await sb('shifts', {
+    method: 'POST',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify(records)
+  });
+}
+
+async function processOneRequest(req) {
+  console.log(`処理開始: ${req.target_year}年${req.target_month}月 (request_id=${req.id})`);
+  await updateRequest(req.id, { status: 'processing', started_at: new Date().toISOString() });
+
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  try {
+    const context = await browser.newContext({
+      viewport: { width: 1600, height: 900 },
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
+    });
+    const page = await context.newPage();
+
+    await loginDentis(page);
+
+    const att = await scrapeMonth(page, req.target_year, req.target_month, false);
+    const vis = await scrapeMonth(page, req.target_year, req.target_month, true);
+
+    const records = aggregate(req.target_year, req.target_month, att.data, vis.data, att.roleMap);
+    console.log(`集計完了: ${records.length}件のスタッフ`);
+    await writeShifts(req.target_year, req.target_month, records);
+
+    await updateRequest(req.id, {
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+      result_message: `${records.length}名のシフトを更新`
+    });
+    console.log('処理完了');
+  } catch (e) {
+    console.error('エラー:', e);
+    await updateRequest(req.id, {
+      status: 'failed',
+      completed_at: new Date().toISOString(),
+      result_message: String(e.message || e).slice(0, 500)
+    });
+  } finally {
+    await browser.close();
+  }
+}
+
+async function main() {
+  for (let i = 0; i < 5; i++) {
+    const req = await getPendingRequest();
+    if (!req) {
+      if (i === 0) console.log('待機中の依頼なし');
+      break;
+    }
+    await processOneRequest(req);
+  }
+}
+
+main().catch(e => {
+  console.error('Fatal:', e);
+  process.exit(1);
+});
