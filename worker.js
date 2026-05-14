@@ -127,27 +127,35 @@ const PAGE_HELPERS = `
 
 async function waitForAttendeesPane(page, maxRetries = 4) {
   for (let i = 0; i < maxRetries; i++) {
-    try {
-      await page.waitForSelector('[class*="WorkingPractitionerPane__Root"]', { timeout: 20000 });
-      return true;
-    } catch {
-      console.log(`  WorkingPractitionerPane が見つからない (試行${i+1}/${maxRetries})`);
-      if (i === 0) await dumpDebug(page, `no_pane_attempt1`);
-      const diag = await page.evaluate(`
-        ({
-          url: location.href,
-          title: document.title,
-          h1: document.querySelector('h1')?.textContent || '',
-          buttons: Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 30),
-          hasMonth: !!document.querySelector('[class*="Navi__Month"]'),
-          hasSchedule: !!document.querySelector('[class*="Schedule__"]'),
-          paneClasses: Array.from(document.querySelectorAll('[class*="Pane"]')).map(el => (el.className||'').toString().split(' ')[0]).filter((v,i,a) => a.indexOf(v)===i)
-        })
-      `);
-      console.log('  診断情報:', JSON.stringify(diag).slice(0, 600));
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(3000);
+    const exists = await page.evaluate(`!!document.querySelector('[class*="WorkingPractitionerPane__Root"]')`);
+    if (exists) return true;
+    const clicked = await page.evaluate(`
+      (function(){
+        const btn = document.querySelector('[class*="WorkingPractitioners__ToggleButton"]');
+        if (!btn) return false;
+        btn.click();
+        return true;
+      })()
+    `);
+    if (clicked) {
+      console.log(`  出勤者ペインのトグルをクリック (試行${i+1}/${maxRetries})`);
+      try {
+        await page.waitForSelector('[class*="WorkingPractitionerPane__Root"]', { timeout: 10000 });
+        return true;
+      } catch {}
     }
+    if (i === 0) await dumpDebug(page, `no_pane_attempt1`);
+    const diag = await page.evaluate(`
+      ({
+        url: location.href,
+        title: document.title,
+        toggleExists: !!document.querySelector('[class*="WorkingPractitioners__ToggleButton"]'),
+        toggleText: document.querySelector('[class*="WorkingPractitioners__ToggleButton"]')?.textContent.trim(),
+        paneClasses: Array.from(document.querySelectorAll('[class*="Pane"]')).map(el => (el.className||'').toString().split(' ')[0]).filter((v,i,a) => a.indexOf(v)===i)
+      })
+    `);
+    console.log(`  診断情報 (試行${i+1}):`, JSON.stringify(diag).slice(0, 400));
+    if (i < maxRetries - 1) await page.waitForTimeout(2500);
   }
   return false;
 }
