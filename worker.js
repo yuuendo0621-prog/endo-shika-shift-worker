@@ -1,10 +1,8 @@
 // 遠藤歯科クリニック - シフト同期ワーカー
 // shift_sync_requests テーブルの pending 行を拾い、Dentis をスクレイピングして shifts を更新する
-// 参考: https://d.dentis-cloud.com/dental/
 
 import { chromium } from 'playwright';
 
-// ============== 環境変数 ==============
 const DENTIS_USERNAME = process.env.DENTIS_USERNAME;
 const DENTIS_PASSWORD = process.env.DENTIS_PASSWORD;
 const DENTIS_SLUG = process.env.DENTIS_SLUG || 'JvbrMX';
@@ -63,15 +61,14 @@ async function updateRequest(id, fields) {
 }
 
 async function loginDentis(page) {
-  await page.goto('https://d.dentis-cloud.com/dental/', { waitUntil: 'domcontentloaded' });
-  await page.evaluate((slug) => localStorage.setItem('slug', slug), DENTIS_SLUG);
   await page.goto('https://d.dentis-cloud.com/dental/signin', { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('input[name="username"]', { timeout: 20000 });
+  await page.waitForSelector('input[name="username"]', { timeout: 30000 });
   await page.fill('input[name="username"]', DENTIS_USERNAME);
   await page.fill('input[name="password"]', DENTIS_PASSWORD);
   await page.getByRole('button', { name: 'サインイン' }).click();
-  await page.waitForURL(/\/dental(\/schedule)?$/, { timeout: 30000 });
-  await page.waitForSelector('[class*="Navi__Month"]', { timeout: 30000 });
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
+  await page.waitForSelector('[class*="Navi__Month"]', { timeout: 60000 });
+  await page.waitForTimeout(2000);
   console.log('Dentis ログイン成功');
 }
 
@@ -118,6 +115,20 @@ const PAGE_HELPERS = `
   }
 `;
 
+async function waitForAttendeesPane(page, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await page.waitForSelector('[class*="WorkingPractitionerPane__Root"]', { timeout: 15000 });
+      return true;
+    } catch {
+      console.log(`  WorkingPractitionerPane が見つからない (試行${i+1}/${maxRetries}) → reload して再試行`);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2500);
+    }
+  }
+  return false;
+}
+
 async function scrapeMonth(page, year, month, isVisit) {
   const daysInMonth = new Date(year, month, 0).getDate();
   const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
@@ -128,31 +139,56 @@ async function scrapeMonth(page, year, month, isVisit) {
 
   console.log(`→ ${baseUrl}`);
   await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('[class*="Navi__Month"]', { timeout: 30000 });
+  await page.waitForSelector('[class*="Navi__Month"]', { timeout: 60000 });
+
+  if (!isVisit) {
+    const ok = await waitForAttendeesPane(page);
+    if (!ok) throw new Error('出勤者ペインが描画されませんでした');
+  }
   await page.waitForTimeout(2500);
 
   const data = {};
   let roleMapAcc = {};
+  let emptyAttendeesStreak = 0;
 
   for (let i = 0; i < daysInMonth + 5; i++) {
     const currentDate = await page.evaluate(`(function(){${PAGE_HELPERS}; return getCurrentDate();})()`);
     if (!currentDate || currentDate > endDate) break;
+
     if (isVisit) {
       data[currentDate] = await page.evaluate(`(function(){${PAGE_HELPERS}; return getVisits();})()`);
     } else {
       const attRes = await page.evaluate(`(function(){${PAGE_HELPERS}; return getAttendees();})()`);
-      if (attRes) {
+      if (attRes && attRes.names.length > 0) {
         data[currentDate] = attRes.names;
         Object.assign(roleMapAcc, attRes.roles);
-      } else {
+        emptyAttendeesStreak = 0;
+      } else if (attRes) {
         data[currentDate] = [];
+        emptyAttendeesStreak++;
+      } else {
+        console.log(`  ${currentDate}: 出勤者ペイン取得失敗 → 再描画待ち`);
+        await page.waitForTimeout(2000);
+        const retry = await page.evaluate(`(function(){${PAGE_HELPERS}; return getAttendees();})()`);
+        if (retry && retry.names.length > 0) {
+          data[currentDate] = retry.names;
+          Object.assign(roleMapAcc, retry.roles);
+        } else {
+          data[currentDate] = [];
+          emptyAttendeesStreak++;
+        }
+      }
+      if (emptyAttendeesStreak >= 8) {
+        throw new Error(`8日連続で出勤者ゼロ — スクレイピングが正しく動いていません`);
       }
     }
+
     if (currentDate >= endDate) break;
     const hasNext = await page.evaluate(`(function(){${PAGE_HELPERS}; const b = getNextBtn(); if (!b) return false; b.click(); return true;})()`);
     if (!hasNext) break;
     await page.waitForTimeout(1800);
   }
+  console.log(`  → ${Object.keys(data).length}日分取得${isVisit ? '' : `, ${Object.keys(roleMapAcc).length}人の役職判定`}`);
   return { data, roleMap: roleMapAcc };
 }
 
@@ -205,11 +241,15 @@ function aggregate(year, month, attendees, visits, roleMap) {
 }
 
 async function writeShifts(year, month, records) {
+  if (records.length === 0) throw new Error('レコード0件のため書き込みをスキップ');
+  const goodStaff = records.filter(r => r.staff_role !== 'その他' || r.staff_name === '遠藤歯科').length;
+  if (goodStaff < 5) {
+    throw new Error(`役職判定できたスタッフが ${goodStaff} 名と少なすぎます — スクレイピング異常の可能性。書き込みを中止`);
+  }
   await sb(`shifts?year=eq.${year}&month=eq.${month}`, {
     method: 'DELETE',
     headers: { Prefer: 'return=minimal' }
   });
-  if (records.length === 0) return;
   await sb('shifts', {
     method: 'POST',
     headers: { Prefer: 'return=minimal' },
@@ -218,21 +258,26 @@ async function writeShifts(year, month, records) {
 }
 
 async function processOneRequest(req) {
-  console.log(`処理開始: ${req.target_year}年${req.target_month}月 (request_id=${req.id})`);
+  console.log(`\n=== 処理開始: ${req.target_year}年${req.target_month}月 (request_id=${req.id}) ===`);
   await updateRequest(req.id, { status: 'processing', started_at: new Date().toISOString() });
 
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   try {
     const context = await browser.newContext({
-      viewport: { width: 1600, height: 900 },
+      viewport: { width: 1920, height: 1080 },
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
-    const page = await context.newPage();
+    await context.addInitScript((slug) => {
+      try { localStorage.setItem('slug', slug); } catch (e) {}
+    }, DENTIS_SLUG);
 
+    const page = await context.newPage();
     await loginDentis(page);
 
+    console.log('出勤者をスクレイピング中…');
     const att = await scrapeMonth(page, req.target_year, req.target_month, false);
+    console.log('訪問をスクレイピング中…');
     const vis = await scrapeMonth(page, req.target_year, req.target_month, true);
 
     const records = aggregate(req.target_year, req.target_month, att.data, vis.data, att.roleMap);
@@ -244,9 +289,9 @@ async function processOneRequest(req) {
       completed_at: new Date().toISOString(),
       result_message: `${records.length}名のシフトを更新`
     });
-    console.log('処理完了');
+    console.log('=== 処理完了 ===');
   } catch (e) {
-    console.error('エラー:', e);
+    console.error('=== エラー ===', e);
     await updateRequest(req.id, {
       status: 'failed',
       completed_at: new Date().toISOString(),
